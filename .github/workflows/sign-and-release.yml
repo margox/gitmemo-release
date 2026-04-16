@@ -82,21 +82,31 @@ jobs:
           mkdir -p release-assets
 
           for arch in macos-aarch64 macos-x86_64; do
-            APP=$(find "artifacts/gitmemo-desktop-${arch}" -name "*.app" -maxdepth 4 | head -1)
+            # Tauri uploads .app.tar.gz, not a raw .app directory — extract first
+            TARBALL=$(find "artifacts/gitmemo-desktop-${arch}" -name "*.app.tar.gz" ! -name "*.sig" | head -1)
+            if [ -z "$TARBALL" ]; then
+              echo "::error::No .app.tar.gz found for ${arch}"
+              exit 1
+            fi
+
+            EXTRACT_DIR="artifacts/gitmemo-desktop-${arch}/extracted"
+            mkdir -p "$EXTRACT_DIR"
+            echo "Extracting ${TARBALL} ..."
+            tar -xzf "$TARBALL" -C "$EXTRACT_DIR"
+
+            APP=$(find "$EXTRACT_DIR" -name "*.app" -maxdepth 2 | head -1)
             if [ -z "$APP" ]; then
-              echo "::error::No .app found for ${arch}"
+              echo "::error::No .app found after extracting ${TARBALL}"
               exit 1
             fi
 
             echo "Signing ${APP} ..."
             codesign --deep --force --verify \
               --options runtime \
-              --entitlements /dev/null \
               --sign "$APPLE_SIGNING_IDENTITY" \
               "$APP"
             codesign --verify --verbose "$APP"
 
-            # Determine architecture label for DMG filename
             case "$arch" in
               macos-aarch64) ARCH_LABEL="aarch64" ;;
               macos-x86_64)  ARCH_LABEL="x86_64"  ;;
