@@ -1,0 +1,186 @@
+name: Sign & Release
+
+on:
+  repository_dispatch:
+    types: [sign-and-release]
+
+jobs:
+  sign-and-release:
+    runs-on: macos-latest
+    env:
+      VERSION: ${{ github.event.client_payload.version }}
+      SRC_RUN_ID: ${{ github.event.client_payload.run_id }}
+      SRC_REPO: ${{ github.event.client_payload.repository }}
+    steps:
+      - name: Checkout (for scripts/)
+        uses: actions/checkout@v4
+
+      # ── 1. Download unsigned artifacts from the dev repo ──────────────────
+      - name: Download CLI artifacts
+        run: |
+          mkdir -p artifacts
+          for arch in macos-aarch64 macos-x86_64; do
+            gh api \
+              "repos/${SRC_REPO}/actions/runs/${SRC_RUN_ID}/artifacts" \
+              --jq ".artifacts[] | select(.name == \"gitmemo-${arch}\") | .id" \
+            | xargs -I{} gh api \
+              "repos/${SRC_REPO}/actions/artifacts/{}/zip" \
+              --header "Accept: application/vnd.github+json" \
+              > "artifacts/gitmemo-${arch}.zip"
+            unzip -o "artifacts/gitmemo-${arch}.zip" -d "artifacts/gitmemo-${arch}/"
+          done
+        env:
+          GH_TOKEN: ${{ secrets.ARTIFACTS_TOKEN }}
+
+      - name: Download desktop artifacts
+        run: |
+          for arch in macos-aarch64 macos-x86_64; do
+            gh api \
+              "repos/${SRC_REPO}/actions/runs/${SRC_RUN_ID}/artifacts" \
+              --jq ".artifacts[] | select(.name == \"gitmemo-desktop-${arch}\") | .id" \
+            | xargs -I{} gh api \
+              "repos/${SRC_REPO}/actions/artifacts/{}/zip" \
+              --header "Accept: application/vnd.github+json" \
+              > "artifacts/gitmemo-desktop-${arch}.zip"
+            unzip -o "artifacts/gitmemo-desktop-${arch}.zip" -d "artifacts/gitmemo-desktop-${arch}/"
+          done
+        env:
+          GH_TOKEN: ${{ secrets.ARTIFACTS_TOKEN }}
+
+      # ── 2. Import Developer ID certificate ────────────────────────────────
+      - name: Import Apple certificate
+        run: |
+          echo "$APPLE_CERTIFICATE" | base64 --decode > certificate.p12
+          KEYCHAIN_PASSWORD=$(openssl rand -hex 16)
+          security create-keychain -p "$KEYCHAIN_PASSWORD" build.keychain
+          security default-keychain -s build.keychain
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" build.keychain
+          security set-keychain-settings -lut 21600 build.keychain
+          security import certificate.p12 \
+            -k build.keychain \
+            -P "$APPLE_CERTIFICATE_PASSWORD" \
+            -T /usr/bin/codesign
+          security set-key-partition-list \
+            -S apple-tool:,apple: \
+            -s -k "$KEYCHAIN_PASSWORD" build.keychain
+          rm certificate.p12
+        env:
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+
+      # ── 3. Write .p8 key file for notarytool ──────────────────────────────
+      - name: Write API key file
+        run: |
+          mkdir -p ~/.private_keys
+          echo "$APPLE_API_KEY" > ~/.private_keys/AuthKey_${{ secrets.APPLE_API_KEY_ID }}.p8
+        env:
+          APPLE_API_KEY: ${{ secrets.APPLE_API_KEY }}
+
+      # ── 4. Sign .app bundles and create signed DMGs ───────────────────────
+      - name: Sign apps and create DMGs
+        run: |
+          mkdir -p release-assets
+
+          for arch in macos-aarch64 macos-x86_64; do
+            APP=$(find "artifacts/gitmemo-desktop-${arch}" -name "*.app" -maxdepth 4 | head -1)
+            if [ -z "$APP" ]; then
+              echo "::error::No .app found for ${arch}"
+              exit 1
+            fi
+
+            echo "Signing ${APP} ..."
+            codesign --deep --force --verify \
+              --options runtime \
+              --entitlements /dev/null \
+              --sign "$APPLE_SIGNING_IDENTITY" \
+              "$APP"
+            codesign --verify --verbose "$APP"
+
+            # Determine architecture label for DMG filename
+            case "$arch" in
+              macos-aarch64) ARCH_LABEL="aarch64" ;;
+              macos-x86_64)  ARCH_LABEL="x86_64"  ;;
+            esac
+
+            DMG="release-assets/GitMemo_${VERSION}_${ARCH_LABEL}.dmg"
+            echo "Creating ${DMG} ..."
+            hdiutil create -volname "GitMemo" \
+              -srcfolder "$APP" \
+              -ov -format UDZO \
+              "$DMG"
+            codesign --sign "$APPLE_SIGNING_IDENTITY" "$DMG"
+          done
+        env:
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+
+      # ── 5. Notarize all DMGs ───────────────────────────────────────────────
+      - name: Notarize DMGs
+        run: |
+          for DMG in release-assets/*.dmg; do
+            echo "Notarizing ${DMG} ..."
+            xcrun notarytool submit "$DMG" \
+              --key ~/.private_keys/AuthKey_${{ secrets.APPLE_API_KEY_ID }}.p8 \
+              --key-id "${{ secrets.APPLE_API_KEY_ID }}" \
+              --issuer "${{ secrets.APPLE_API_ISSUER_ID }}" \
+              --wait \
+              --timeout 30m
+          done
+
+      # ── 6. Staple notarization tickets ────────────────────────────────────
+      - name: Staple DMGs
+        run: |
+          for DMG in release-assets/*.dmg; do
+            echo "Stapling ${DMG} ..."
+            xcrun stapler staple "$DMG"
+            xcrun stapler validate "$DMG"
+          done
+
+      # ── 7. Collect remaining release assets ───────────────────────────────
+      - name: Collect all release assets
+        run: |
+          # CLI binaries
+          cp artifacts/gitmemo-macos-aarch64/gitmemo-macos-aarch64 release-assets/ 2>/dev/null || true
+          cp artifacts/gitmemo-macos-x86_64/gitmemo-macos-x86_64   release-assets/ 2>/dev/null || true
+
+          # .app.tar.gz + .sig (for Tauri updater)
+          copy_desktop_pair() {
+            local suffix="$1"
+            local dir="artifacts/gitmemo-desktop-${suffix}"
+            local tar sig out
+            tar=$(find "$dir" -type f -name "*.app.tar.gz" ! -name "*.sig" | head -1)
+            sig=$(find "$dir" -type f -name "*.app.tar.gz.sig" | head -1)
+            if [ -z "$tar" ]; then
+              echo "::error::no .app.tar.gz under $dir"; return 1
+            fi
+            out="GitMemo-desktop-${suffix}.app.tar.gz"
+            cp "$tar" "release-assets/${out}"
+            [ -f "$sig" ] && cp "$sig" "release-assets/${out}.sig"
+          }
+          copy_desktop_pair "macos-aarch64"
+          copy_desktop_pair "macos-x86_64"
+
+          ls -lh release-assets/
+
+      # ── 8. Generate latest.json for Tauri updater ─────────────────────────
+      - name: Generate latest.json
+        run: python3 scripts/write_latest_json.py
+        env:
+          VERSION_TAG: ${{ env.VERSION }}
+          RELEASE_REPOSITORY: ${{ env.SRC_REPO }}
+
+      # ── 9. Publish Release on the dev repo ────────────────────────────────
+      - name: Create GitHub Release
+        run: |
+          gh release delete "$VERSION" \
+            --repo "$SRC_REPO" --yes 2>/dev/null || true
+          gh release create "$VERSION" \
+            --repo "$SRC_REPO" \
+            --generate-notes \
+            release-assets/*
+        env:
+          GH_TOKEN: ${{ secrets.RELEASE_TOKEN }}
+
+      # ── 10. Cleanup keychain ──────────────────────────────────────────────
+      - name: Cleanup keychain
+        if: always()
+        run: security delete-keychain build.keychain 2>/dev/null || true
