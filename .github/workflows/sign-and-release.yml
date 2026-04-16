@@ -128,13 +128,31 @@ jobs:
         run: |
           for DMG in release-assets/*.dmg; do
             echo "Notarizing ${DMG} ..."
-            xcrun notarytool submit "$DMG" \
+            RESULT=$(xcrun notarytool submit "$DMG" \
               --key ~/.private_keys/AuthKey_${{ secrets.APPLE_API_KEY_ID }}.p8 \
               --key-id "${{ secrets.APPLE_API_KEY_ID }}" \
               --issuer "${{ secrets.APPLE_API_ISSUER_ID }}" \
               --wait \
-              --timeout 30m
+              --timeout 30m \
+              --output-format json)
+            echo "$RESULT"
+            STATUS=$(echo "$RESULT" | python3 -c "import sys,json; print(json.load(sys.stdin).get('status',''))")
+            if [ "$STATUS" != "Accepted" ]; then
+              echo "::error::Notarization failed for ${DMG}: status=${STATUS}"
+              # Fetch full log for diagnosis
+              SUBMISSION_ID=$(echo "$RESULT" | python3 -c "import sys,json; print(json.load(sys.stdin).get('id',''))")
+              if [ -n "$SUBMISSION_ID" ]; then
+                xcrun notarytool log "$SUBMISSION_ID" \
+                  --key ~/.private_keys/AuthKey_${{ secrets.APPLE_API_KEY_ID }}.p8 \
+                  --key-id "${{ secrets.APPLE_API_KEY_ID }}" \
+                  --issuer "${{ secrets.APPLE_API_ISSUER_ID }}"
+              fi
+              exit 1
+            fi
+            echo "Notarization accepted for ${DMG}"
           done
+          # Allow a few seconds for the ticket to propagate to CloudKit
+          sleep 10
 
       # ── 6. Staple notarization tickets ────────────────────────────────────
       - name: Staple DMGs
