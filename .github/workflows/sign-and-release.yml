@@ -112,10 +112,16 @@ jobs:
               macos-x86_64)  ARCH_LABEL="x86_64"  ;;
             esac
 
+            # Create DMG with both .app and Applications symlink (for drag-and-drop install)
+            DMG_TEMP="artifacts/gitmemo-desktop-${arch}/dmg-contents"
+            mkdir -p "$DMG_TEMP"
+            cp -r "$APP" "$DMG_TEMP/"
+            ln -s /Applications "$DMG_TEMP/Applications"
+
             DMG="release-assets/GitMemo_${VERSION}_${ARCH_LABEL}.dmg"
             echo "Creating ${DMG} ..."
             hdiutil create -volname "GitMemo" \
-              -srcfolder "$APP" \
+              -srcfolder "$DMG_TEMP" \
               -ov -format UDZO \
               "$DMG"
             codesign --sign "$APPLE_SIGNING_IDENTITY" "$DMG"
