@@ -112,11 +112,30 @@ jobs:
               macos-x86_64)  ARCH_LABEL="x86_64"  ;;
             esac
 
-            # Create DMG with both .app and Applications symlink (for drag-and-drop install)
+            # Extract .DS_Store from original Tauri DMG for layout/styling
+            ORIG_DMG=$(find "artifacts/gitmemo-desktop-${arch}" -name "*.dmg" | head -1)
+            DS_STORE=""
+            if [ -n "$ORIG_DMG" ]; then
+              echo "Extracting layout from original DMG ..."
+              MOUNT_POINT=$(mktemp -d)
+              hdiutil attach "$ORIG_DMG" -mountpoint "$MOUNT_POINT" -nobrowse
+              if [ -f "$MOUNT_POINT/.DS_Store" ]; then
+                DS_STORE="$MOUNT_POINT/.DS_Store"
+              fi
+              # Mount persists; will detach after copying
+            fi
+
+            # Create DMG with both .app and Applications symlink
             DMG_TEMP="artifacts/gitmemo-desktop-${arch}/dmg-contents"
+            rm -rf "$DMG_TEMP"
             mkdir -p "$DMG_TEMP"
             cp -r "$APP" "$DMG_TEMP/"
             ln -s /Applications "$DMG_TEMP/Applications"
+
+            # Copy .DS_Store if found
+            if [ -n "$DS_STORE" ] && [ -f "$DS_STORE" ]; then
+              cp "$DS_STORE" "$DMG_TEMP/.DS_Store"
+            fi
 
             DMG="release-assets/GitMemo_${VERSION}_${ARCH_LABEL}.dmg"
             echo "Creating ${DMG} ..."
@@ -124,6 +143,12 @@ jobs:
               -srcfolder "$DMG_TEMP" \
               -ov -format UDZO \
               "$DMG"
+
+            # Detach original DMG if still mounted
+            if [ -n "$MOUNT_POINT" ] && [ -d "$MOUNT_POINT" ]; then
+              hdiutil detach "$MOUNT_POINT" 2>/dev/null || true
+            fi
+
             codesign --sign "$APPLE_SIGNING_IDENTITY" "$DMG"
           done
         env:
